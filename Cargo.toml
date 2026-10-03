@@ -1,0 +1,20 @@
+[package]
+name = "loudness-normalize-h"
+version = "2.0.1"
+edition = "2021"
+license = "MIT"
+authors = ["HexBrowns"]
+description = "ラウドネスノーマライズ_H - EBU R128 loudness normalizer for AviUtl2"
+publish = false
+
+[lib]
+name = "loudness_normalize_h"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1.0"
+aviutl2 = "0.47"
+dashmap = "6.2"
+
+[profile.release]
+lto = true

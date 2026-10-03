@@ -1,0 +1,17 @@
+[Language]
+Information=English Language for ラウドネスノーマライズ_H
+
+[ラウドネスノーマライズ_H]
+バイパス=Bypass
+モード=Mode
+静的（EBU R128 準拠）=Static (EBU R128)
+リアルタイム（レベラー）=Realtime (Leveler)
+ターゲット LUFS=Target LUFS
+トゥルーピーク上限 dBTP=True Peak Ceiling (dBTP)
+最大ゲイン dB=Max Gain (dB)
+リアルタイム=Realtime
+追従の速さ dB/秒=Slew Rate (dB/s)
+最小ゲイン dB=Min Gain (dB)
+静的=Static
+解析をやり直す=Re-analyze
+測定値=Measurement
