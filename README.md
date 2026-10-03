@@ -1,5 +1,7 @@
 # LoudnessNormalize_H マニュアル
 
+<img src="images/LoudnessNormalize_H_screen.png" width="360">
+
 **ラウドネスノーマライズ_H**（LoudnessNormalize_H）は、音声オブジェクトの音量を **EBU R128 / ITU-R BS.1770-4** に沿って測り、指定したラウドネス（LUFS）にそろえる AviUtl2 用の音声フィルタ効果（Rust 製 `.auf2`）です。
 「動画ごとに音の大きさがばらばら」「素材ごとに聞こえる大きさが違う」を、耳ではなく規格の物差しでそろえます。
 
