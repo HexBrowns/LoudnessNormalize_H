@@ -163,10 +163,40 @@ impl EffectState {
     }
 }
 
-#[aviutl2::plugin(FilterPlugin)]
-struct LoudnessNormalize {
-    states: dashmap::DashMap<i64, EffectState>,
+/// エフェクトのインスタンスごとのユーザーデータ。
+///
+/// 本体がエフェクトのインスタンスごとに作り（`func_create`）、編集データと Undo の中から
+/// そのインスタンスが全部消えたら片付ける（`func_destroy`。`aviutl2-sys` 0.47 の `filter2.rs`）。
+/// v2.0.1 までは `effect_id` をキーにした `DashMap` に持ち、エフェクトを消しても取り除いていなかった。
+///
+/// 作られる時点ではサンプリングレートも総サンプル数も分からないので、中身は最初の `proc_audio` で作る。
+#[derive(Default)]
+struct EffectSlot {
+    state: Option<EffectState>,
 }
+
+impl aviutl2::filter::FilterUserdata for EffectSlot {
+    fn new(_effect_id: i64) -> Self {
+        Self::default()
+    }
+}
+
+impl EffectSlot {
+    /// 状態を取る。無ければ作り、素性（レート・長さ）が変わっていたら作り直す。
+    /// 作り直したときは前の (レート, 総サンプル数) を返す。
+    fn get(&mut self, mode: Mode, sample_rate: f64, sample_total: u64) -> (&mut EffectState, Option<(f64, u64)>) {
+        match self.state {
+            Some(ref mut state) => {
+                let old = state.ensure(mode, sample_rate, sample_total);
+                (state, old)
+            }
+            None => (self.state.insert(EffectState::new(mode, sample_rate, sample_total)), None),
+        }
+    }
+}
+
+#[aviutl2::plugin(FilterPlugin)]
+struct LoudnessNormalize;
 
 /// 測定結果と設定から、実際に掛けるゲイン（dB）を決める。
 ///
@@ -185,8 +215,8 @@ fn decide_gain_db(analysis: &Analysis, config: &FilterConfig) -> Option<f64> {
 }
 
 impl FilterPlugin for LoudnessNormalize {
-    // aviutl2 0.41 から必須。効果ごとの状態は今までどおり `states`（effect_id で引く DashMap）に持つので使わない
-    type Userdata = ();
+    // 効果ごとの状態。エフェクトが消えたら本体が片付ける（v2.0.1 までは DashMap に持ち、消えても残っていた）
+    type Userdata = EffectSlot;
 
     fn new(_info: aviutl2::AviUtl2Info) -> aviutl2::AnyResult<Self> {
         aviutl2::tracing_subscriber::fmt()
@@ -198,9 +228,7 @@ impl FilterPlugin for LoudnessNormalize {
             .event_format(aviutl2::logger::AviUtl2Formatter)
             .with_writer(aviutl2::logger::AviUtl2LogWriter)
             .init();
-        Ok(Self {
-            states: dashmap::DashMap::new(),
-        })
+        Ok(Self)
     }
 
     fn plugin_info(&self) -> FilterPluginTable {
@@ -250,12 +278,11 @@ impl FilterPlugin for LoudnessNormalize {
             right.copy_from_slice(&left);
         }
 
-        let mut state = self
-            .states
-            .entry(effect_id)
-            .or_insert_with(|| EffectState::new(config.mode, sample_rate, sample_total));
+        // 状態のロックはゲインを決め終えるまで持ち、書き戻し（set_sample_data）の前に放す
+        let mut slot = audio.userdata.write();
+        let (state, renewed) = slot.get(config.mode, sample_rate, sample_total);
 
-        if let Some((old_rate, old_total)) = state.ensure(config.mode, sample_rate, sample_total) {
+        if let Some((old_rate, old_total)) = renewed {
             tracing::info!(
                 "オブジェクトの素性が変わったので測り直す: {}Hz {} サンプル → {}Hz {} サンプル (effect_id {effect_id})",
                 old_rate,
@@ -420,6 +447,7 @@ impl FilterPlugin for LoudnessNormalize {
                 Some(gain_db)
             }
         };
+        drop(slot);
 
         // 静的モードのゲインをここで掛ける（リアルタイムは既に掛かっている）。
         if let Some(gain_db) = gain_db {
@@ -513,5 +541,38 @@ mod tests {
     #[test]
     fn default_persisted_is_invalid() {
         assert_ne!(Persisted::default().magic, PERSIST_MAGIC);
+    }
+
+    /// 本体が作った直後のユーザーデータは空で、最初の呼び出しで状態を作る。
+    #[test]
+    fn slot_is_created_lazily() {
+        let mut slot = <EffectSlot as aviutl2::filter::FilterUserdata>::new(42);
+        assert!(slot.state.is_none());
+        let (state, renewed) = slot.get(Mode::Static, 48000.0, 480_000);
+        assert!(renewed.is_none());
+        assert_eq!(state.sample_total, 480_000);
+        assert!(slot.state.is_some());
+    }
+
+    /// 同じ素性なら状態（貯めた測定）を持ち越し、モードだけ追従する。
+    #[test]
+    fn slot_keeps_state_while_source_is_same() {
+        let mut slot = EffectSlot::default();
+        slot.get(Mode::Static, 48000.0, 480_000).0.last_force = true;
+        let (state, renewed) = slot.get(Mode::Realtime, 48000.0, 480_000);
+        assert!(renewed.is_none());
+        assert!(state.last_force, "作り直していない");
+        assert_eq!(state.mode, Mode::Realtime);
+    }
+
+    /// 素性（長さ・レート）が変わったら作り直し、前の値を返す。
+    #[test]
+    fn slot_renews_when_source_changes() {
+        let mut slot = EffectSlot::default();
+        slot.get(Mode::Static, 48000.0, 480_000).0.last_force = true;
+        let (state, renewed) = slot.get(Mode::Static, 44100.0, 441_000);
+        assert_eq!(renewed, Some((48000.0, 480_000)));
+        assert!(!state.last_force, "作り直した");
+        assert_eq!(state.sample_total, 441_000);
     }
 }

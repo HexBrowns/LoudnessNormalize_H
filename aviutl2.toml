@@ -1,0 +1,33 @@
+#:schema ./.aviutl2-cli/aviutl2.schema.json
+#
+# ビルドと配布の設定（aviutl2-cli: https://github.com/sevenc-nanashi/aviutl2-cli）。
+#   au2 release   テストしてからビルドし、release/ に au2pkg とカタログ用の catalog.json を作る
+# project.version は Cargo.toml の version と揃える。
+
+[project]
+id = "HexBrowns.LoudnessNormalize_H"
+name = "ラウドネスノーマライズ_H"
+version = "2.0.2"
+
+[artifacts."LoudnessNormalize_H.auf2"]
+build = "cargo build --release"
+source = "target/release/loudness_normalize_h.dll"
+destination = "Plugin/LoudnessNormalize_H/LoudnessNormalize_H.auf2"
+
+[artifacts."English.loudness_normalize_h.aul2"]
+source = "i18n/English.loudness_normalize_h.aul2"
+destination = "Language/English.loudness_normalize_h.aul2"
+
+[release]
+# テストの後、インストール時のダイアログに本体と依存クレートのライセンスを出す
+prebuild = [
+    "cargo test",
+    'copy /b /y LICENSE + THIRD_PARTY_CRATES.md release\package.txt >nul',
+]
+package_template = "release/package.txt"
+package_information = "{name} v{version} by HexBrowns"
+
+[catalog]
+id = "HexBrowns.LoudnessNormalize_H"
+license_path = { type = "MIT", path = "./LICENSE" }
+download_repo = { owner = "HexBrowns", repo = "LoudnessNormalize_H" }

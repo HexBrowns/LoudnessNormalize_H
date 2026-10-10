@@ -129,10 +129,13 @@ v2 は測定チェーンの部品が同じで、入口がファイルから実�
 ## ビルド
 
 ```powershell
-& "C:\ProgramData\aviutl2\AI\plugins\LoudnessNormalize_H\build.ps1"
+python AI/tools/au2_build.py LoudnessNormalize_H               # au2 release → 本番（C:\ProgramData\aviutl2）へ配置
+python AI/tools/au2_build.py LoudnessNormalize_H --no-deploy   # 配置しない（本番との違いだけ出す）
 ```
 
-`-NoDeploy` で配置せずビルドのみ、`-SkipTest` でテストを飛ばす。
+ビルドと同梱物は `aviutl2.toml`（[aviutl2-cli](https://github.com/sevenc-nanashi/aviutl2-cli)）が正本。このフォルダで `au2 release` だけを実行すると `release/` に au2pkg ができる。
+
+`--skip-test` で prebuild の `cargo test` を飛ばす。
 **プラグインの差し替えには AviUtl2 の再起動が必要。**
 
 ## 既存の `loudness_normalize.auf2` との関係
