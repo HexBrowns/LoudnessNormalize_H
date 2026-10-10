@@ -1,6 +1,6 @@
 [package]
 name = "loudness-normalize-h"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2021"
 license = "MIT"
 authors = ["HexBrowns"]
@@ -14,7 +14,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = "1.0"
 aviutl2 = "0.47"
-dashmap = "6.2"
 
 [profile.release]
 lto = true

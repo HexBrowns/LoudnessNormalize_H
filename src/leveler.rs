@@ -28,6 +28,10 @@ const PEAK_DECAY_SECS: f64 = 1.0;
 /// これより静かな区間ではゲインを動かさない（ノイズを持ち上げないため）。
 const SILENCE_LUFS: f64 = -70.0;
 
+fn db_to_gain(db: f64) -> f64 {
+    10.0_f64.powf(db / 20.0)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LevelerParams {
     pub target_lufs: f64,
@@ -138,17 +142,29 @@ impl Leveler {
             return;
         }
         if sample_index != self.expected_next {
-            // シーク。フィルタの内部状態は使えない。
-            // ゲインは保つ（ここで 0 に戻すと音量が飛ぶ）。
-            self.k_left.reset();
-            self.k_right.reset();
-            self.tp_left.reset_history();
-            self.tp_right.reset_history();
-            self.cur_acc = 0.0;
-            self.cur_n = 0;
+            if sample_index == 0 {
+                // オブジェクトの先頭から始まった（書き出し・頭からの再生）。
+                // 何もかも初期状態に戻す。前に止めた位置のゲインを持ち込むと、
+                // 書き出すたびに冒頭の音量が変わる。
+                *self = Self::new(self.sample_rate);
+            } else {
+                // 途中へのシーク。フィルタの内部状態は使えない。
+                // ゲインは保つ（ここで 0 に戻すと音量が飛ぶ）。
+                self.k_left.reset();
+                self.k_right.reset();
+                self.tp_left.reset_history();
+                self.tp_right.reset_history();
+                self.cur_acc = 0.0;
+                self.cur_n = 0;
+            }
         }
 
         let max_step_db = p.rate_db_per_sec / self.sample_rate;
+        // 1 サンプルの最大の動き（dB）を倍率にしたもの。目標へ一定の速さで寄せている間は、
+        // 倍率をこれで掛けていけば dB で足すのと同じになる（サンプルごとの powf を避ける）。
+        let up = db_to_gain(max_step_db);
+        let down = db_to_gain(-max_step_db);
+        let mut g = db_to_gain(self.gain_db);
 
         for i in 0..left.len() {
             let l = left[i] as f64;
@@ -170,15 +186,27 @@ impl Leveler {
                 self.cur_acc = 0.0;
                 self.cur_n = 0;
                 self.update_target(p);
+                // 掛け算の積み重ねの誤差を 100ms ごとに捨てる
+                g = db_to_gain(self.gain_db);
             }
 
             // 目標へ寄せる。1 サンプルで動かしてよい量に上限を置く。
             let diff = self.target_db - self.gain_db;
-            self.gain_db += diff.clamp(-max_step_db, max_step_db);
+            if diff > max_step_db {
+                self.gain_db += max_step_db;
+                g *= up;
+            } else if diff < -max_step_db {
+                self.gain_db -= max_step_db;
+                g *= down;
+            } else if diff != 0.0 {
+                // 目標に着いた。ここから先は目標が変わるまで同じ倍率。
+                self.gain_db = self.target_db;
+                g = db_to_gain(self.gain_db);
+            }
 
-            let g = 10.0_f64.powf(self.gain_db / 20.0) as f32;
-            left[i] *= g;
-            right[i] *= g;
+            let gf = g as f32;
+            left[i] *= gf;
+            right[i] *= gf;
         }
 
         self.expected_next = sample_index + left.len() as u64;
@@ -284,6 +312,112 @@ mod tests {
             "無音でゲインが {:.3} dB 動いた",
             lev.gain_db()
         );
+    }
+
+    /// 頭（サンプル位置 0）から流し直すと、前にどこで止めていても同じ出力になる（書き出しが再現する）。
+    #[test]
+    fn restart_from_zero_is_reproducible() {
+        let fs = 48000.0;
+        let sig = sine(1000.0, -33.0, 8.0, fs);
+        let p = params(-14.0, -1.0, 6.0);
+
+        let collect = |lev: &mut Leveler| {
+            let mut out = Vec::new();
+            let mut pos = 0usize;
+            while pos < sig.len() {
+                let end = (pos + 1600).min(sig.len());
+                let mut l: Vec<f32> = sig[pos..end].to_vec();
+                let mut r = l.clone();
+                lev.process(pos as u64, &mut l, &mut r, &p);
+                out.extend_from_slice(&l);
+                pos = end;
+            }
+            out
+        };
+
+        let mut fresh = Leveler::new(fs);
+        let want = collect(&mut fresh);
+
+        // 途中まで再生して止め（ゲインが上がった状態）、頭から書き出す
+        let mut used = Leveler::new(fs);
+        run(&mut used, &sig[..sig.len() / 2], 1600, &p);
+        assert!(used.gain_db() > 1.0, "前提: ゲインが動いている");
+        let got = collect(&mut used);
+        assert_eq!(got, want, "頭から流し直した結果が初回と違う");
+    }
+
+    /// 途中へのシークではゲインを保つ（0 に戻して音量を飛ばさない）。
+    #[test]
+    fn seek_to_middle_keeps_gain() {
+        let fs = 48000.0;
+        let sig = sine(1000.0, -33.0, 8.0, fs);
+        let p = params(-14.0, -1.0, 6.0);
+        let mut lev = Leveler::new(fs);
+        run(&mut lev, &sig, 1600, &p);
+        let before = lev.gain_db();
+        let mut l = sig[48000..49600].to_vec();
+        let mut r = l.clone();
+        lev.process(48000, &mut l, &mut r, &p);
+        assert!((lev.gain_db() - before).abs() < 0.01, "{before} → {}", lev.gain_db());
+    }
+
+    /// サンプルごとの powf をやめても、出力は前の計算（サンプルごとに dB から倍率を求める）と変わらない。
+    #[test]
+    fn gain_stepping_matches_per_sample_powf() {
+        let fs = 48000.0;
+        // 大きくなったり小さくなったりする音（目標が上下に動く）
+        let mut sig = sine(1000.0, -33.0, 6.0, fs);
+        sig.extend(sine(1000.0, -8.0, 6.0, fs));
+        sig.extend(sine(1000.0, -40.0, 6.0, fs));
+        let p = params(-14.0, -1.0, 3.0);
+
+        let mut lev = Leveler::new(fs);
+        let mut reference = Leveler::new(fs);
+        let max_step_db = p.rate_db_per_sec / fs;
+        let mut worst = 0.0f32;
+        let mut pos = 0usize;
+        while pos < sig.len() {
+            let end = (pos + 1600).min(sig.len());
+            let mut l: Vec<f32> = sig[pos..end].to_vec();
+            let mut r = l.clone();
+            lev.process(pos as u64, &mut l, &mut r, &p);
+
+            // 前の計算: 同じ測定の流れで、倍率だけサンプルごとに powf で求める
+            if pos == 0 {
+                reference.expected_next = 0;
+            }
+            for (i, &x) in sig[pos..end].iter().enumerate() {
+                let xf = x as f64;
+                let local = reference
+                    .tp_left
+                    .push_and_peak(xf)
+                    .max(reference.tp_right.push_and_peak(xf));
+                reference.peak_hold = (reference.peak_hold * reference.peak_decay).max(local);
+                let w = reference.k_left.process(xf);
+                let w2 = reference.k_right.process(xf);
+                reference.cur_acc += w * w + w2 * w2;
+                reference.cur_n += 1;
+                if reference.cur_n == reference.step {
+                    let slot = reference.ring_pos;
+                    reference.ring[slot] = reference.cur_acc;
+                    reference.ring_pos = (slot + 1) % reference.ring.len();
+                    reference.ring_filled = (reference.ring_filled + 1).min(reference.ring.len());
+                    reference.cur_acc = 0.0;
+                    reference.cur_n = 0;
+                    reference.update_target(&p);
+                }
+                let diff = reference.target_db - reference.gain_db;
+                reference.gain_db += diff.clamp(-max_step_db, max_step_db);
+                let g = 10.0_f64.powf(reference.gain_db / 20.0) as f32;
+                let want = x * g;
+                worst = worst.max((l[i] - want).abs());
+            }
+            reference.expected_next = end as u64;
+            pos = end;
+        }
+        // 16bit の 1 段（3e-5）より十分小さい
+        assert!(worst < 1e-6, "最大の差 {worst}");
+        assert!((lev.gain_db() - reference.gain_db).abs() < 1e-6);
     }
 
     /// 出力が実際に掛かっている（素通しではない）。

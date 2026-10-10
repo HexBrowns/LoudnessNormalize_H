@@ -37,12 +37,29 @@ pub struct Measured {
     pub true_peak_dbtp: f64,
 }
 
+/// 測定が確定しないまま、新しい通し（頭からの再生・書き出しのやり直し）が始まったときの様子。
+/// ログで「止まっている」ことと原因の見当を知らせるのに使う。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stall {
+    /// 埋まったパートの割合（0.0〜1.0）
+    pub coverage: f64,
+    /// これまでに届いた一番後ろの位置（サンプル）
+    pub furthest_end: u64,
+    /// 埋まっていないパートの数
+    pub missing_parts: usize,
+    /// 末尾が一度も届いていない（確定に要る 98% の位置まで来ていない）
+    pub tail_unreached: bool,
+}
+
 #[derive(Debug)]
 pub struct StaticAnalyzer {
     step: usize,
     settle_samples: usize,
+    sample_total: u64,
     /// 100ms パートごとの二乗和（左右合算）。未取得は `None`。
     parts: Vec<Option<f64>>,
+    /// `parts` の埋まった数。確定の判定を毎回 O(1) にするために数えておく。
+    filled: usize,
     k_left: r128::KWeighting,
     k_right: r128::KWeighting,
     tp_left: r128::TruePeak,
@@ -61,6 +78,10 @@ pub struct StaticAnalyzer {
     /// 直前に食わせた範囲。ホストが同じブロックを再描画したときに
     /// 「シーク」と誤認してフィルタ状態を捨てないようにするための記録。
     last_fed: Option<(u64, usize)>,
+    /// 今の通し（不連続から次の不連続まで）の始まりの位置
+    run_start: u64,
+    /// これまでに届いた一番後ろの位置
+    furthest_end: u64,
 }
 
 impl StaticAnalyzer {
@@ -70,7 +91,9 @@ impl StaticAnalyzer {
         Self {
             step,
             settle_samples: (sample_rate * SETTLE_MS / 1000.0).round() as usize,
+            sample_total,
             parts: vec![None; part_count],
+            filled: 0,
             k_left: r128::KWeighting::new(sample_rate),
             k_right: r128::KWeighting::new(sample_rate),
             tp_left: r128::TruePeak::new(),
@@ -83,6 +106,8 @@ impl StaticAnalyzer {
             cur_valid: false,
             touched: false,
             last_fed: None,
+            run_start: 0,
+            furthest_end: 0,
         }
     }
 
@@ -91,18 +116,17 @@ impl StaticAnalyzer {
         self.parts.len()
     }
 
-    /// 埋まったパートの割合（0.0〜1.0）。進捗表示用。
+    /// 埋まったパートの割合（0.0〜1.0）。進捗表示用。毎回呼んでよい（数えてあるので O(1)）。
     pub fn coverage(&self) -> f64 {
         if self.parts.is_empty() {
             return 0.0;
         }
-        let filled = self.parts.iter().filter(|p| p.is_some()).count();
-        filled as f64 / self.parts.len() as f64
+        self.filled as f64 / self.parts.len() as f64
     }
 
     /// 埋まったパート数。
     pub fn filled_parts(&self) -> usize {
-        self.parts.iter().filter(|p| p.is_some()).count()
+        self.filled
     }
 
     pub fn is_complete(&self) -> bool {
@@ -110,20 +134,29 @@ impl StaticAnalyzer {
     }
 
     /// 実際に鳴っている音を食わせる。`sample_index` はオブジェクト先頭からの位置。
-    pub fn feed(&mut self, sample_index: u64, left: &[f32], right: &[f32]) {
+    ///
+    /// 確定しないまま新しい通しが始まった（前の通しの始まりより前へ戻った）ときだけ、
+    /// その時点の様子を返す。
+    pub fn feed(&mut self, sample_index: u64, left: &[f32], right: &[f32]) -> Option<Stall> {
         debug_assert_eq!(left.len(), right.len());
         if left.is_empty() {
-            return;
+            return None;
         }
         // 同じ範囲がもう一度来たら、それは再描画であってシークではない。
         // ここでフィルタ状態を捨てると、再描画のたびに前後のパートが
         // 「落ち着き待ち」で捨てられ、いつまでも埋まらなくなる。
         if self.last_fed == Some((sample_index, left.len())) {
-            return;
+            return None;
         }
-        self.touched = true;
+        let mut stall = None;
 
         if sample_index != self.expected_next {
+            // 前の通しの始まりかそれより前へ戻った = 通しをやり直している。
+            // そこで確定していなければ、前の通しでは足りなかったということ。
+            if self.touched && sample_index <= self.run_start && !self.is_complete() {
+                stall = Some(self.stall());
+            }
+            self.run_start = sample_index;
             // 不連続。フィルタの内部状態は使えない。
             self.k_left.reset();
             self.k_right.reset();
@@ -140,6 +173,7 @@ impl StaticAnalyzer {
             self.cur_n = 0;
             self.cur_valid = false;
         }
+        self.touched = true;
 
         let step = self.step as u64;
         for (i, (&l, &r)) in left.iter().zip(right.iter()).enumerate() {
@@ -178,13 +212,28 @@ impl StaticAnalyzer {
         self.commit_part();
 
         self.expected_next = sample_index + left.len() as u64;
+        self.furthest_end = self.furthest_end.max(self.expected_next);
         self.last_fed = Some((sample_index, left.len()));
+        stall
+    }
+
+    /// 今の様子。
+    fn stall(&self) -> Stall {
+        Stall {
+            coverage: self.coverage(),
+            furthest_end: self.furthest_end,
+            missing_parts: self.parts.len() - self.filled,
+            tail_unreached: (self.furthest_end as f64) < self.sample_total as f64 * COMPLETE_COVERAGE,
+        }
     }
 
     /// 書き込み中のパートが最後まで揃っていれば確定させる。
     fn commit_part(&mut self) {
         if self.cur_valid && self.cur_n == self.step {
             if let Some(slot) = self.parts.get_mut(self.cur_part) {
+                if slot.is_none() {
+                    self.filled += 1;
+                }
                 *slot = Some(self.cur_acc);
             }
         }
@@ -355,6 +404,77 @@ mod tests {
         assert!(a.is_complete(), "1% 欠けで完了しない: {:.3}", a.coverage());
         let lufs = a.result().expect("結果が出ない").integrated_lufs.unwrap();
         assert!((lufs - (-23.0)).abs() < 0.1, "{lufs} LUFS");
+    }
+
+    /// 数えている埋まった数が、配列を数え直した値と常に一致する（描き直し・シークを混ぜても）。
+    #[test]
+    fn filled_count_matches_scan() {
+        let fs = 48000.0;
+        let sig = sine(1000.0, -23.0, 20.0, fs);
+        let mut a = StaticAnalyzer::new(fs, sig.len() as u64);
+        let chunk = 1600usize;
+        let order: Vec<usize> = (0..sig.len() / chunk)
+            .map(|i| (i * 7) % (sig.len() / chunk))
+            .collect();
+        for &i in order.iter().chain(order.iter()) {
+            let pos = i * chunk;
+            a.feed(pos as u64, &sig[pos..pos + chunk], &sig[pos..pos + chunk]);
+            a.feed(pos as u64, &sig[pos..pos + chunk], &sig[pos..pos + chunk]);
+            let scanned = a.parts.iter().filter(|p| p.is_some()).count();
+            assert_eq!(a.filled_parts(), scanned);
+        }
+    }
+
+    /// 末尾が配られないまま（範囲選択をした書き出しで、オブジェクトの末尾が範囲の外にある等）通しをやり直すと、
+    /// 「末尾が届いていない」と分かる。
+    #[test]
+    fn restart_without_tail_reports_tail_unreached() {
+        let fs = 48000.0;
+        let sig = sine(1000.0, -23.0, 20.0, fs);
+        let mut a = StaticAnalyzer::new(fs, sig.len() as u64);
+        let stop = sig.len() * 9 / 10;
+        let chunk = 1600usize;
+        for _ in 0..2 {
+            let mut pos = 0usize;
+            let mut stalls = Vec::new();
+            while pos < stop {
+                let end = (pos + chunk).min(stop);
+                if let Some(s) = a.feed(pos as u64, &sig[pos..end], &sig[pos..end]) {
+                    stalls.push((pos, s));
+                }
+                pos = end;
+            }
+            if let Some((at, s)) = stalls.first() {
+                assert_eq!(*at, 0, "通しの頭でだけ知らせる");
+                assert!(s.tail_unreached, "{s:?}");
+                assert!((s.coverage - 0.9).abs() < 0.02, "{s:?}");
+                assert_eq!(s.furthest_end as usize, stop);
+            }
+        }
+        assert!(!a.is_complete());
+    }
+
+    /// 頭から最後まで届いているのに途中が欠けているなら、「途中が欠けている」と分かる。
+    #[test]
+    fn restart_with_gaps_reports_gaps() {
+        let fs = 48000.0;
+        let sig = sine(1000.0, -23.0, 20.0, fs);
+        let mut a = StaticAnalyzer::new(fs, sig.len() as u64);
+        let chunk = 1600usize;
+        // 2〜3 秒を飛ばして最後まで（5% 欠け）
+        let mut pos = 0usize;
+        while pos < sig.len() {
+            if pos == 2 * 48000 {
+                pos = 3 * 48000;
+            }
+            let end = (pos + chunk).min(sig.len());
+            assert!(a.feed(pos as u64, &sig[pos..end], &sig[pos..end]).is_none(), "前へ進む飛びでは知らせない");
+            pos = end;
+        }
+        assert!(!a.is_complete());
+        let s = a.feed(0, &sig[..chunk], &sig[..chunk]).expect("頭に戻ったのに知らせない");
+        assert!(!s.tail_unreached, "{s:?}");
+        assert!(s.missing_parts >= 10, "{s:?}");
     }
 
     /// 400ms に満たないオブジェクトでは結果を出さない。
